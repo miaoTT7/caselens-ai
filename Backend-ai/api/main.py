@@ -3,7 +3,6 @@ from pydantic import BaseModel
 from dotenv import load_dotenv, find_dotenv
 import os
 import shutil
-import fitz  # PyMuPDF
 import numpy as np
 import faiss
 import json
@@ -12,9 +11,9 @@ from sentence_transformers import SentenceTransformer
 from fastapi.middleware.cors import CORSMiddleware
 from groq import Groq
 import spacy
-import re as re
-from docx import Document
 from fastapi.concurrency import run_in_threadpool
+from api.document_chunker import chunk_document
+from api.document_parser import parse_document, parse_docx, parse_pdf
 
 
 from spacy.cli import download
@@ -55,28 +54,6 @@ app.add_middleware(
 
 
 # ---------- Utilities ----------
-def extract_text_from_pdf(file_path: str) -> str:
-    doc = fitz.open(file_path)
-    text = ""
-    for page in doc:
-        text += page.get_text()
-    doc.close()
-    return text
-
-def extract_clauses_from_pdf(text: str) -> list[str]:
-    # hello
-    text2 = text
-    # Step 1: Normalize whitespace across the entire text
-    cleaned_text = re.sub(r'\s+', ' ', text).strip()
-
-    # Step 2: Split into clauses and clean again
-    clauses = [
-        clause.strip()
-        for clause in cleaned_text.split(".")
-        if len(clause.strip()) > 20
-    ]
-
-    return clauses
 
 def parse_and_enhance_query(user_query):
     doc = nlp(user_query)
@@ -155,6 +132,28 @@ Response:
 def root():
     return {"message": "Insurance Claim API running with Groq API for LLM."}
 
+
+@app.post("/parse-document")
+async def parse_uploaded_document(file: UploadFile = File(...)):
+    """Parse a supported file without running retrieval or claim analysis."""
+    filename = os.path.basename(file.filename or "")
+    if not filename:
+        raise HTTPException(status_code=400, detail="A filename is required.")
+    file_path = os.path.join(UPLOAD_DIR, filename)
+    with open(file_path, "wb") as destination:
+        destination.write(await file.read())
+    try:
+        document = await run_in_threadpool(parse_document, file_path)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=f"Failed to parse document: {error}") from error
+    chunks = await run_in_threadpool(chunk_document, document)
+    return {
+        "parsed_document": document.to_dict(),
+        "chunks": [chunk.to_dict() for chunk in chunks],
+    }
+
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), user_query: str = Form(...)):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
@@ -165,8 +164,9 @@ async def upload_pdf(file: UploadFile = File(...), user_query: str = Form(...)):
 
     # Step 2: Run heavy logic in a background thread to prevent blocking
     def process_pdf():
-        text = extract_text_from_pdf(file_path)
-        real_clauses = extract_clauses_from_pdf(text)
+        document = parse_pdf(file_path)
+        chunks = chunk_document(document)
+        real_clauses = [chunk.text for chunk in chunks]
         if not real_clauses:
             raise HTTPException(status_code=400, detail="No valid clauses found in PDF.")
 
@@ -180,13 +180,15 @@ async def upload_pdf(file: UploadFile = File(...), user_query: str = Form(...)):
         # Search for relevant clauses
         parsed_query = parse_and_enhance_query(user_query)
         query_embedding = model.encode([parsed_query])
-        distances, indices = index.search(np.array(query_embedding), 5)
+        distances, indices = index.search(np.array(query_embedding), min(5, len(real_clauses)))
         matched_clauses = [real_clauses[i] for i in indices[0]]
 
         top_clauses = ', '.join(matched_clauses[:5])
         llm_result = process_claim(user_query, top_clauses)
 
         return {
+            "parsed_document": document.to_dict(),
+            "chunks": [chunk.to_dict() for chunk in chunks],
             "matched_clauses": matched_clauses,
             "LLM_response": llm_result
         }
@@ -197,6 +199,8 @@ async def upload_pdf(file: UploadFile = File(...), user_query: str = Form(...)):
     return {
         "message": "File uploaded and processed successfully.",
         "user_query": user_query,
+        "parsed_document": result["parsed_document"],
+        "chunks": result["chunks"],
         "matched_clauses": result["matched_clauses"],
         "LLM_response": result["LLM_response"]
     }
@@ -209,15 +213,14 @@ async def upload_doc(file: UploadFile = File(...), user_query: str = Form(...)):
     with open(file_path, "wb") as f:
         f.write(await file.read())
 
-    # Extract text from DOCX
+    # Parse document blocks, preserving paragraph and table order.
     try:
-        document = Document(file_path)
-        text = "\n".join([para.text for para in document.paragraphs])
+        document = parse_docx(file_path)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to read Word document.")
 
-    # Clause extraction
-    real_clauses = extract_clauses_from_pdf(text)  # You can rename this to extract_clauses_from_doc if needed
+    chunks = chunk_document(document)
+    real_clauses = [chunk.text for chunk in chunks]
 
     if not real_clauses:
         raise HTTPException(status_code=400, detail="No valid clauses found in Word document.")
@@ -233,7 +236,7 @@ async def upload_doc(file: UploadFile = File(...), user_query: str = Form(...)):
     parsed_query = parse_and_enhance_query(user_query)
     print("Parsed Query:", parsed_query)
     query_embedding = model.encode([parsed_query])
-    distances, indices = index.search(np.array(query_embedding), 5)
+    distances, indices = index.search(np.array(query_embedding), min(5, len(real_clauses)))
 
     # Matched clauses
     matched_clauses = [real_clauses[i] for i in indices[0]]
@@ -246,6 +249,8 @@ async def upload_doc(file: UploadFile = File(...), user_query: str = Form(...)):
     return {
         "message": "Word document uploaded and processed successfully.",
         "user_query": user_query,
+        "parsed_document": document.to_dict(),
+        "chunks": [chunk.to_dict() for chunk in chunks],
         "matched_clauses": matched_clauses,
         "LLM_response": result
     }

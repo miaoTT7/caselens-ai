@@ -29,6 +29,7 @@ const fileTypeConfig = {
   },
 };
 
+// useState
 export default function UploadPage() {
   const { type } = useParams<{ type: string }>();
   const [fileName, setFileName] = useState("");
@@ -52,7 +53,7 @@ export default function UploadPage() {
 
   const IconComponent = config.icon;
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange =  (e: React.ChangeEvent<HTMLInputElement>)=> {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
       setFile(selectedFile);
