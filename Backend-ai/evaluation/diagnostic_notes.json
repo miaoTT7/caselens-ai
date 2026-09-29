@@ -1,0 +1,42 @@
+{
+  "Q01": {
+    "main_failure_reason": "An adjacent exclusions chunk contains a higher concentration of exact theft terms, while the correct 492-token chunk mixes worldwide belongings cover, care obligations, pedal cycles, and card cover.",
+    "recommended_next_action": "Split optional-cover subsections more precisely, then test keyword plus vector fusion and reranking."
+  },
+  "Q02": {
+    "main_failure_reason": "The top result is a water-damage exclusion with stronger lexical overlap; the embedding ranking does not reliably distinguish covered events from exclusions.",
+    "recommended_next_action": "Preserve coverage-versus-exclusion clause type metadata and test a reranker that considers query intent and polarity."
+  },
+  "Q03": {
+    "main_failure_reason": "The correct chunk is 384 tokens and combines multiple optional covers and exclusions. Higher-ranked chunks mention accidental damage or contents more densely but refer to the wrong insured object or only exclusions.",
+    "recommended_next_action": "Split on policy subheadings such as Extra accidental damage to contents, retain the insured object in metadata, and then compare hybrid retrieval plus reranking."
+  },
+  "Q04": {
+    "main_failure_reason": "No retrieval failure: the exact H1 Gross negligence chunk ranks first.",
+    "recommended_next_action": "Keep this query as a positive control for later retrieval comparisons."
+  },
+  "Q05": {
+    "main_failure_reason": "The correct bicycle chunk is mixed with neighboring luggage text and describes loss rather than repeatedly using theft. Competing chunks contain denser exact theft and pedal-cycle terms.",
+    "recommended_next_action": "Fix PDF column and subsection boundaries for F2, then test lexical fusion and reranking for bicycle-specific intent."
+  },
+  "Q06": {
+    "main_failure_reason": "Ground Truth is incomplete: the current top-ranked General conditions chunk directly instructs the policyholder to contact the insurer and police. The selected expected chunk is longer and focused on contact channels and required documents.",
+    "recommended_next_action": "Review whether the current Top-1 chunk should also be labeled relevant; use graded or multiple relevant chunks before changing retrieval."
+  },
+  "Q07": {
+    "main_failure_reason": "No retrieval failure: the tenant liability chunk ranks first after Ground Truth alignment.",
+    "recommended_next_action": "Keep this query as a positive control and retain parser page metadata separately from printed PDF page labels."
+  },
+  "Q08": {
+    "main_failure_reason": "No retrieval failure: the jewelry benefit-limit chunk ranks first.",
+    "recommended_next_action": "Keep this query as a positive control for exact limits and valuables terminology."
+  },
+  "Q09": {
+    "main_failure_reason": "The correct 485-token chunk mixes alternative accommodation with replacement locks, landscaping, and freezer contents. The query says temporarily uninhabitable while the policy says alternative accommodation, weakening both lexical and semantic focus.",
+    "recommended_next_action": "Split the alternative-accommodation subsection into its own chunk and later test query expansion or reranking for uninhabitable-to-accommodation terminology."
+  },
+  "Q10": {
+    "main_failure_reason": "The top GCI chunk is also highly relevant to reduction for breach of duties, but Ground Truth currently labels only AXA chunks. The generic query does not identify a policy, creating cross-document answer ambiguity.",
+    "recommended_next_action": "Either label all independently correct policy chunks or add a document/policy constraint to the query before evaluating ranking changes."
+  }
+}

@@ -3,10 +3,13 @@
 venv/
 __pycache__/
 *.pyc
+.DS_Store
 
 # Environment variables
 .env
+.env.*
+!.env.example
 
 # PDF files
 *.pdf
-
+Backend-ai/evaluation/results/

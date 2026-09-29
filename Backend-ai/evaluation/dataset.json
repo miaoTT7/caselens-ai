@@ -1,0 +1,165 @@
+{
+  "name": "insurance_retrieval_baseline_v1",
+  "knowledge_base": "insurance-evaluation",
+  "description": "Initial household insurance semantic retrieval evaluation.",
+  "queries": [
+    {
+      "id": "Q01",
+      "category": "theft",
+      "query": "Does the policy cover theft of personal belongings outside the home?",
+      "expected_chunk_ids": [
+        "4e7a6d04-dba2-4ed0-86b5-c216c07cbf0d"
+      ],
+      "expected_sources": [
+        {
+          "document": "home_insurance_policy_wording_insurance_home_nhdhg6080_v35_012017_140617.pdf",
+          "pages": [27, 28],
+          "sections": ["Personal belongings"]
+        }
+      ]
+    },
+    {
+      "id": "Q02",
+      "category": "water_damage",
+      "query": "What types of water damage are covered by this household insurance?",
+      "expected_chunk_ids": [
+        "e024d2da-78e7-4d6d-8550-429a485b0d98"
+      ],
+      "expected_sources": [
+        {
+          "document": "16162EN-AXA-Household-GIP-2021-10D.pdf",
+          "pages": [16, 17],
+          "sections": ["D7 Insured risks and losses"]
+        }
+      ]
+    },
+    {
+      "id": "Q03",
+      "category": "accidental_damage",
+      "query": "Are accidental damages to household contents included in the coverage?",
+      "expected_chunk_ids": [
+        "6dbaeec0-5a18-402a-866a-0b7ee31fdb27"
+      ],
+      "expected_sources": [
+        {
+          "document": "home_insurance_policy_wording_insurance_home_nhdhg6080_v35_012017_140617.pdf",
+          "pages": [24, 25],
+          "sections": ["Contents – optional covers"]
+        }
+      ]
+    },
+    {
+      "id": "Q04",
+      "category": "negligence",
+      "query": "How does gross negligence affect insurance benefits?",
+      "expected_chunk_ids": [
+        "1ff3d9a7-e6dd-427f-bd14-497eccdfeaf2"
+      ],
+      "expected_sources": [
+        {
+          "document": "16162EN-AXA-Household-GIP-2021-10D.pdf",
+          "pages": [30],
+          "sections": ["H1 Gross negligence"]
+        }
+      ]
+    },
+    {
+      "id": "Q05",
+      "category": "bicycle_theft",
+      "query": "Is bicycle theft covered, and are there any special conditions?",
+      "expected_chunk_ids": [
+        "2be47e18-9589-4e01-b02c-42586aa73139"
+      ],
+      "expected_sources": [
+        {
+          "document": "16162EN-AXA-Household-GIP-2021-10D.pdf",
+          "pages": [22],
+          "sections": ["F2 Bicycles, e-bikes and sports equipment"]
+        }
+      ]
+    },
+    {
+      "id": "Q06",
+      "category": "claim_procedure",
+      "query": "What should I do after discovering damage or loss in my home?",
+      "expected_chunk_ids": [
+        "51121e07-71e1-4595-833f-d8a6b4a34dab",
+        "55e89397-f68a-4819-b252-913980dfd5bd"
+      ],
+      "expected_sources": [
+        {
+          "document": "home_insurance_policy_wording_insurance_home_nhdhg6080_v35_012017_140617.pdf",
+          "pages": [4],
+          "sections": ["How to get help"]
+        }
+      ]
+    },
+    {
+      "id": "Q07",
+      "category": "rented_property",
+      "query": "Does personal liability insurance cover damage caused by a tenant to rented property?",
+      "expected_chunk_ids": [
+        "7c3f4ae0-8d1f-4d47-b99b-ba88e556f587"
+      ],
+      "expected_sources": [
+        {
+          "document": "GCI_Household_Insurance_09.2022.pdf",
+          "pages": [33, 34],
+          "sections": ["Personal Liability Insurance"]
+        }
+      ]
+    },
+    {
+      "id": "Q08",
+      "category": "valuables",
+      "query": "Are valuable items such as jewellery subject to special coverage limits?",
+      "expected_chunk_ids": [
+        "245e706e-85bb-47eb-b8fc-459bc98b9b50"
+      ],
+      "expected_sources": [
+        {
+          "document": "GCI_Household_Insurance_09.2022.pdf",
+          "pages": [14],
+          "sections": ["113.2.1 Benefit limit for jewelry"]
+        }
+      ]
+    },
+    {
+      "id": "Q09",
+      "category": "temporary_accommodation",
+      "query": "What costs are covered if the home becomes temporarily uninhabitable after a claim?",
+      "expected_chunk_ids": [
+        "c42fc7a9-d16b-4a49-903d-9f74214576fa"
+      ],
+      "expected_sources": [
+        {
+          "document": "home_insurance_policy_wording_insurance_home_nhdhg6080_v35_012017_140617.pdf",
+          "pages": [21],
+          "sections": ["Loss of rent and cost of alternative accommodation"]
+        }
+      ]
+    },
+    {
+      "id": "Q10",
+      "category": "claim_reduction",
+      "query": "Under what circumstances can the insurer reduce or refuse a claim payment?",
+      "expected_chunk_ids": [
+        "2920d13b-686c-4d96-8065-85f1a1af23d7",
+        "d71ebdf2-470e-41c9-82b9-b0dcebf81257",
+        "567a53a2-b17b-4568-8706-e7b8c61d6a81"
+      ],
+      "expected_sources": [
+        {
+          "document": "16162EN-AXA-Household-GIP-2021-10D.pdf",
+          "pages": [33],
+          "sections": ["I1 General"]
+        },
+        {
+          "document": "16162EN-AXA-Household-GIP-2021-10D.pdf",
+          "pages": [35],
+          "sections": ["J4 Reduction of compensation"]
+        }
+      ]
+    }
+  ]
+}

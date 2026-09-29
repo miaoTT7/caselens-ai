@@ -31,6 +31,53 @@ class DocumentParserTests(unittest.TestCase):
         self.assertTrue(all(len(block.positions[0]) == 4 for block in parsed.blocks))
         self.assertIn("Hospital cover", parsed.blocks[0].text)
 
+    def test_pdf_splits_subsection_inside_raw_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.pdf"
+            pdf = fitz.open()
+            page = pdf.new_page()
+            page.insert_textbox(
+                fitz.Rect(72, 72, 520, 160),
+                "Extra accidental damage to contents\nAll other accidental damage to contents is covered.",
+                fontsize=10,
+            )
+            pdf.save(path)
+            pdf.close()
+
+            parsed = parse_pdf(path)
+
+        self.assertEqual(parsed.blocks[0].type, "title")
+        self.assertTrue(parsed.blocks[0].is_subsection)
+        self.assertEqual(parsed.blocks[0].text, "Extra accidental damage to contents")
+        self.assertEqual(parsed.blocks[1].type, "paragraph")
+        self.assertEqual(parsed.blocks[1].section[-1], "Extra accidental damage to contents")
+        self.assertEqual(len(parsed.blocks[0].positions), 1)
+
+    def test_pdf_orders_two_columns_without_crossing_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "policy.pdf"
+            pdf = fitz.open()
+            page = pdf.new_page(width=600, height=840)
+            page.insert_text((40, 40), "Policy wording", fontsize=16)
+            page.insert_textbox(fitz.Rect(40, 100, 280, 145), "F2\nBicycles, e-bikes and sports equipment", fontsize=11)
+            page.insert_textbox(fitz.Rect(40, 160, 280, 230), "F2.1\nInsured property\nBicycles are insured.", fontsize=9)
+            page.insert_textbox(fitz.Rect(320, 100, 560, 170), "F2.3\nInsured risks and losses\nAccidental loss is covered.", fontsize=9)
+            page.insert_textbox(fitz.Rect(320, 190, 560, 250), "F3\nLuggage\nLuggage is insured.", fontsize=9)
+            pdf.save(path)
+            pdf.close()
+
+            parsed = parse_pdf(path)
+
+        titles = [block.text for block in parsed.blocks if block.type == "title"]
+        f21 = next(index for index, title in enumerate(titles) if title.startswith("F2.1"))
+        f23 = next(index for index, title in enumerate(titles) if title.startswith("F2.3"))
+        f3 = next(index for index, title in enumerate(titles) if title.startswith("F3"))
+        self.assertLess(f21, f23)
+        self.assertLess(f23, f3)
+        f2_blocks = [block for block in parsed.blocks if block.section and block.section[0].startswith("F2 ")]
+        self.assertTrue(f2_blocks)
+        self.assertTrue(all(block.column_id in {0, 1} for block in f2_blocks))
+
     def test_docx_preserves_heading_paragraph_table_and_list_order(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "policy.docx"

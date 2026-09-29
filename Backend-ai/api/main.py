@@ -1,46 +1,72 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from pydantic import BaseModel
-from dotenv import load_dotenv, find_dotenv
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI, File, UploadFile, Form, HTTPException, status
+from dotenv import load_dotenv
 import os
-import shutil
-import numpy as np
-import faiss
+import tempfile
+import uuid
 import json
-import requests
 from sentence_transformers import SentenceTransformer
 from fastapi.middleware.cors import CORSMiddleware
-from groq import Groq
-import spacy
 from fastapi.concurrency import run_in_threadpool
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from api.database import check_database_connection, close_database_connection, get_database_session
 from api.document_chunker import chunk_document
 from api.document_parser import parse_document, parse_docx, parse_pdf
-
-
-from spacy.cli import download
+from api.ingestion import DocumentIngestionService
+from api.llm_service import GroundedAnswerService, LLMProviderError
+from api.repositories import ChunkRepository, DocumentRepository, KnowledgeBaseRepository
+from api.retrieval import SemanticRetrievalService
+from api.schemas import (
+    ChunkResponse,
+    DocumentResponse,
+    GroundedAskRequest,
+    GroundedAskResponse,
+    KnowledgeBaseCreate,
+    KnowledgeBaseResponse,
+    SemanticSearchRequest,
+    SemanticSearchResponse,
+)
 
 
 # ---------- Setup ----------
 
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+BACKEND_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+load_dotenv(dotenv_path=os.path.join(BACKEND_ROOT, ".env"), override=True)
 
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
-# Ensure the model is available
-# ✅ Safe deployment version
-try:
-    nlp = spacy.load("en_core_web_sm")
-except OSError:
-    nlp = None          # graceful fallback – no hard download during boot
+nlp = None
+
+
+def _legacy_nlp():
+    """Load spaCy only when a legacy FAISS upload route needs it."""
+    global nlp
+    if nlp is None:
+        try:
+            import spacy
+
+            nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            return None
+    return nlp
 
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await check_database_connection()
+    yield
+    await close_database_connection()
 
-app = FastAPI()
+
+app = FastAPI(lifespan=lifespan)
 UPLOAD_DIR = "uploaded_pdfs"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -56,7 +82,10 @@ app.add_middleware(
 # ---------- Utilities ----------
 
 def parse_and_enhance_query(user_query):
-    doc = nlp(user_query)
+    pipeline = _legacy_nlp()
+    if pipeline is None:
+        return user_query
+    doc = pipeline(user_query)
     keywords = []
     
     # Extract proper nouns, nouns, medical terms, numbers, locations, dates
@@ -76,6 +105,8 @@ def parse_and_enhance_query(user_query):
 
 
 def process_claim(user_query: str, clause: str):
+    import requests
+
     prompt = f"""
 You are an insurance claim analyst. Based on the user query and clause, decide the claim outcome.
 
@@ -133,6 +164,162 @@ def root():
     return {"message": "Insurance Claim API running with Groq API for LLM."}
 
 
+@app.get("/health/database")
+async def database_health():
+    try:
+        return await check_database_connection()
+    except Exception as error:
+        raise HTTPException(status_code=503, detail=f"Database unavailable: {error}") from error
+
+
+@app.post(
+    "/knowledge-bases",
+    response_model=KnowledgeBaseResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_knowledge_base(
+    payload: KnowledgeBaseCreate,
+    session: AsyncSession = Depends(get_database_session),
+):
+    repository = KnowledgeBaseRepository(session)
+    try:
+        knowledge_base = await repository.create(
+            name=payload.name.strip(), description=payload.description
+        )
+        await session.commit()
+        return knowledge_base
+    except IntegrityError as error:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="A knowledge base with this name already exists") from error
+
+
+@app.get("/knowledge-bases", response_model=list[KnowledgeBaseResponse])
+async def list_knowledge_bases(session: AsyncSession = Depends(get_database_session)):
+    return await KnowledgeBaseRepository(session).list()
+
+
+@app.get("/knowledge-bases/{knowledge_base_id}", response_model=KnowledgeBaseResponse)
+async def get_knowledge_base(
+    knowledge_base_id: uuid.UUID,
+    session: AsyncSession = Depends(get_database_session),
+):
+    knowledge_base = await KnowledgeBaseRepository(session).get(knowledge_base_id)
+    if knowledge_base is None:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    return knowledge_base
+
+
+@app.post(
+    "/knowledge-bases/{knowledge_base_id}/search",
+    response_model=SemanticSearchResponse,
+)
+async def search_knowledge_base(
+    knowledge_base_id: uuid.UUID,
+    payload: SemanticSearchRequest,
+    session: AsyncSession = Depends(get_database_session),
+):
+    try:
+        results = await SemanticRetrievalService(session, model).search(knowledge_base_id, payload)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return SemanticSearchResponse(query=payload.query.strip(), results=results)
+
+
+@app.post("/ask", response_model=GroundedAskResponse)
+async def ask_question(
+    payload: GroundedAskRequest,
+    session: AsyncSession = Depends(get_database_session),
+):
+    query = payload.query.strip()
+    try:
+        results = await SemanticRetrievalService(session, model).search(
+            payload.knowledge_base_id,
+            SemanticSearchRequest(
+                query=query,
+                limit=payload.limit,
+                retrieval_mode="hybrid_rerank",
+            ),
+        )
+        answer, citations = await GroundedAnswerService().answer(query, results)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except LLMProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail=f"Grounded answer generation failed: {error}") from error
+    return GroundedAskResponse(
+        query=query,
+        answer=answer.answer,
+        evidence_ids=answer.evidence_ids,
+        insufficient_evidence=answer.insufficient_evidence,
+        citations=citations,
+    )
+
+
+@app.post(
+    "/knowledge-bases/{knowledge_base_id}/documents",
+    response_model=DocumentResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def ingest_document(
+    knowledge_base_id: uuid.UUID,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_database_session),
+):
+    filename = os.path.basename(file.filename or "")
+    if not filename:
+        raise HTTPException(status_code=400, detail="A filename is required")
+
+    suffix = os.path.splitext(filename)[1]
+    temporary_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as temporary:
+            temporary_path = temporary.name
+            while content := await file.read(1024 * 1024):
+                temporary.write(content)
+        service = DocumentIngestionService(session, model)
+        return await service.ingest(
+            knowledge_base_id=knowledge_base_id,
+            file_path=temporary_path,
+            original_filename=filename,
+        )
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Document ingestion failed: {error}") from error
+    finally:
+        await file.close()
+        if temporary_path and os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+@app.get("/documents/{document_id}", response_model=DocumentResponse)
+async def get_persisted_document(
+    document_id: uuid.UUID,
+    session: AsyncSession = Depends(get_database_session),
+):
+    document = await DocumentRepository(session).get(document_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
+
+
+@app.get("/documents/{document_id}/chunks", response_model=list[ChunkResponse])
+async def list_persisted_chunks(
+    document_id: uuid.UUID,
+    session: AsyncSession = Depends(get_database_session),
+):
+    if await DocumentRepository(session).get(document_id) is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return await ChunkRepository(session).list_for_document(document_id)
+
+
 @app.post("/parse-document")
 async def parse_uploaded_document(file: UploadFile = File(...)):
     """Parse a supported file without running retrieval or claim analysis."""
@@ -164,6 +351,9 @@ async def upload_pdf(file: UploadFile = File(...), user_query: str = Form(...)):
 
     # Step 2: Run heavy logic in a background thread to prevent blocking
     def process_pdf():
+        import faiss
+        import numpy as np
+
         document = parse_pdf(file_path)
         chunks = chunk_document(document)
         real_clauses = [chunk.text for chunk in chunks]
@@ -208,6 +398,9 @@ async def upload_pdf(file: UploadFile = File(...), user_query: str = Form(...)):
 
 @app.post("/upload-docs")
 async def upload_doc(file: UploadFile = File(...), user_query: str = Form(...)):
+    import faiss
+    import numpy as np
+
     # Save uploaded file
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as f:

@@ -8,7 +8,7 @@ from docx import Document
 from openpyxl import Workbook
 
 from api.document_chunker import chunk_document
-from api.document_parser import parse_csv, parse_docx, parse_eml, parse_pdf, parse_xlsx
+from api.document_parser import DocumentBlock, ParsedDocument, parse_csv, parse_docx, parse_eml, parse_pdf, parse_xlsx
 
 
 class DocumentChunkerTests(unittest.TestCase):
@@ -30,6 +30,61 @@ class DocumentChunkerTests(unittest.TestCase):
         self.assertEqual(chunks[0].source_block_orders, [0, 1])
         self.assertTrue(chunks[0].positions)
         self.assertIn("Coverage", chunks[0].text)
+
+    def test_pdf_subsections_are_hard_chunk_boundaries(self):
+        document = ParsedDocument(
+            name="policy.pdf",
+            format="pdf",
+            blocks=[
+                DocumentBlock("Contents", "title", 0, ["Contents"], level=1),
+                DocumentBlock(
+                    "Loss of rent and cost of alternative accommodation",
+                    "title",
+                    1,
+                    ["Contents", "Loss of rent and cost of alternative accommodation"],
+                    level=2,
+                    is_subsection=True,
+                ),
+                DocumentBlock(
+                    "We pay reasonable alternative accommodation costs.",
+                    "paragraph",
+                    2,
+                    ["Contents", "Loss of rent and cost of alternative accommodation"],
+                ),
+                DocumentBlock(
+                    "Replacement locks",
+                    "title",
+                    3,
+                    ["Contents", "Replacement locks"],
+                    level=2,
+                    is_subsection=True,
+                ),
+                DocumentBlock("We pay to replace keys and locks.", "paragraph", 4, ["Contents", "Replacement locks"]),
+            ],
+        )
+
+        chunks = chunk_document(document, max_tokens=512)
+
+        accommodation = next(chunk for chunk in chunks if "alternative accommodation costs" in chunk.text)
+        locks = next(chunk for chunk in chunks if "replace keys and locks" in chunk.text)
+        self.assertNotIn("Replacement locks", accommodation.text)
+        self.assertNotIn("alternative accommodation", locks.text)
+
+    def test_pdf_paragraphs_do_not_merge_across_columns(self):
+        section = ["F2 Bicycles, e-bikes and sports equipment", "F2.2 Property not insured"]
+        document = ParsedDocument(
+            name="policy.pdf",
+            format="pdf",
+            blocks=[
+                DocumentBlock("Left-column exclusions.", "paragraph", 0, section, column_id=0),
+                DocumentBlock("Right-column continuation.", "paragraph", 1, section, column_id=1),
+            ],
+        )
+
+        chunks = chunk_document(document, max_tokens=512)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertNotIn("Right-column", chunks[0].text)
 
     def test_docx_respects_sections_and_keeps_table_atomic(self):
         with tempfile.TemporaryDirectory() as tmp:

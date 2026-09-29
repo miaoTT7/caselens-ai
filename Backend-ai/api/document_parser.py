@@ -5,6 +5,7 @@ but do not control how source structure is represented here.
 """
 
 import csv
+import re
 from dataclasses import asdict, dataclass, field
 from email import policy
 from email.parser import BytesParser
@@ -31,6 +32,8 @@ class DocumentBlock:
     sheet: str | None = None
     row_start: int | None = None
     row_end: int | None = None
+    column_id: int | None = None
+    is_subsection: bool = False
 
 
 @dataclass
@@ -48,6 +51,117 @@ class ParsedDocument:
 
 def _clean(text: str) -> str:
     return " ".join(text.split())
+
+
+@dataclass
+class _PDFLine:
+    text: str
+    bbox: list[float]
+    font_size: float
+    bold: bool
+
+
+@dataclass
+class _PDFTextBlock:
+    lines: list[_PDFLine]
+    bbox: list[float]
+    column_id: int | None = None
+
+
+_CLAUSE_RE = re.compile(r"^(?P<code>(?:[A-Z]\d+(?:\.\d+)*|\d+\.\d+(?:\.\d+)*))(?:[.)])?(?:\s+|$)")
+_KNOWN_SUBSECTION_HEADINGS = {
+    "extra accidental damage to contents",
+    "loss of rent and cost of alternative accommodation",
+}
+
+
+def _pdf_line(raw_line: dict) -> _PDFLine | None:
+    spans = [span for span in raw_line.get("spans", []) if span.get("text", "").strip()]
+    text = _clean("".join(span.get("text", "") for span in raw_line.get("spans", [])))
+    if not text:
+        return None
+    fonts = " ".join(str(span.get("font", "")).lower() for span in spans)
+    flags = [int(span.get("flags", 0)) for span in spans]
+    return _PDFLine(
+        text=text,
+        bbox=[round(float(value), 2) for value in raw_line["bbox"]],
+        font_size=max((float(span.get("size", 0)) for span in spans), default=0),
+        bold="bold" in fonts or any(flag & 16 for flag in flags),
+    )
+
+
+def _column_order(blocks: list[_PDFTextBlock], page_width: float) -> list[_PDFTextBlock]:
+    """Return a deterministic reading order for simple one/two-column pages."""
+    midpoint = page_width / 2
+    gutter = page_width * 0.025
+    left = [block for block in blocks if block.bbox[2] <= midpoint + gutter]
+    right = [block for block in blocks if block.bbox[0] >= midpoint - gutter]
+    two_columns = len(left) >= 2 and len(right) >= 2
+    if not two_columns:
+        for block in blocks:
+            block.column_id = None
+        return sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
+
+    full_width = [block for block in blocks if block not in left and block not in right]
+    for block in left:
+        block.column_id = 0
+    for block in right:
+        block.column_id = 1
+
+    # Full-width blocks divide the page into vertical regions. Within each
+    # region, read the left column completely before the right column.
+    ordered: list[_PDFTextBlock] = []
+    boundaries = sorted(full_width, key=lambda block: (block.bbox[1], block.bbox[0]))
+    region_top = float("-inf")
+    for boundary in [*boundaries, None]:
+        region_bottom = boundary.bbox[1] if boundary is not None else float("inf")
+        region = [block for block in [*left, *right] if region_top <= block.bbox[1] < region_bottom]
+        ordered.extend(sorted(region, key=lambda block: (block.column_id, block.bbox[1], block.bbox[0])))
+        if boundary is not None:
+            boundary.column_id = None
+            ordered.append(boundary)
+            region_top = boundary.bbox[3]
+    return ordered
+
+
+def _clause_level(text: str) -> int | None:
+    match = _CLAUSE_RE.match(text)
+    if not match:
+        return None
+    return match.group("code").count(".") + 1
+
+
+def _looks_like_pdf_heading(line: _PDFLine, body_size: float) -> bool:
+    text = line.text.strip()
+    if not text or len(text) > 120 or text.startswith(("•", "-", "–")):
+        return False
+    if _clause_level(text) is not None or text.casefold() in _KNOWN_SUBSECTION_HEADINGS:
+        return True
+    return line.bold or (body_size > 0 and line.font_size >= body_size * 1.08)
+
+
+def _heading_run(lines: list[_PDFLine], start: int, body_size: float) -> tuple[str, int, int, bool]:
+    """Return heading text, next line index, level and subsection marker."""
+    first = lines[start]
+    level = _clause_level(first.text)
+    selected = [first]
+    next_index = start + 1
+    if level is not None and next_index < len(lines):
+        following = lines[next_index]
+        if len(following.text) <= 100 and not following.text.endswith((".", ";", ":")) and (
+            following.bold or following.font_size > body_size * 1.08
+        ):
+            selected.append(following)
+            next_index += 1
+    known = first.text.casefold() in _KNOWN_SUBSECTION_HEADINGS
+    subsection = level is not None or known or first.font_size < body_size * 1.2
+    if level is None:
+        level = 2 if subsection else 1
+    return " ".join(line.text for line in selected), next_index, level, subsection
+
+
+def _update_heading_path(headings: list[str], title: str, level: int) -> list[str]:
+    return headings[: level - 1] + [title]
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -73,36 +187,70 @@ def parse_pdf(path: str | Path) -> ParsedDocument:
             outline.append({"title": title, "level": level, "page_number": page})
 
         for page_number, page in enumerate(pdf, start=1):
-            page_blocks = []
-            for raw in page.get_text("dict", sort=True)["blocks"]:
+            page_blocks: list[_PDFTextBlock] = []
+            page_font_sizes: list[float] = []
+            for raw in page.get_text("dict", sort=False)["blocks"]:
                 if raw.get("type") != 0:
                     continue
-                lines = raw.get("lines", [])
-                text = _clean("\n".join("".join(span["text"] for span in line["spans"]) for line in lines))
-                if not text:
+                lines = [line for item in raw.get("lines", []) if (line := _pdf_line(item)) is not None]
+                if not lines:
                     continue
-                font_sizes = [span["size"] for line in lines for span in line["spans"] if span["text"].strip()]
-                page_blocks.append((raw, text, max(font_sizes, default=0)))
-
-            # Font size is only a hint; PDF bookmarks remain the explicit outline.
-            body_sizes = sorted(size for _, _, size in page_blocks)
-            # Use the lower median so a page containing only one heading and
-            # one body block does not treat the heading size as body text.
-            body_size = body_sizes[(len(body_sizes) - 1) // 2] if body_sizes else 0
-            for raw, text, size in page_blocks:
-                is_title = len(text) <= 120 and size > body_size * 1.2
-                if is_title:
-                    headings = [text]
-                blocks.append(
-                    DocumentBlock(
-                        text=text,
-                        type="title" if is_title else "paragraph",
-                        order=len(blocks),
-                        section=headings.copy(),
-                        page_number=page_number,
-                        positions=[[round(float(value), 2) for value in raw["bbox"]]],
+                page_font_sizes.extend(line.font_size for line in lines)
+                page_blocks.append(
+                    _PDFTextBlock(
+                        lines=lines,
+                        bbox=[round(float(value), 2) for value in raw["bbox"]],
                     )
                 )
+
+            sizes = sorted(page_font_sizes)
+            body_size = sizes[(len(sizes) - 1) // 2] if sizes else 0
+            for raw_block in _column_order(page_blocks, page.rect.width):
+                lines = raw_block.lines
+                cursor = 0
+                paragraph_lines: list[_PDFLine] = []
+
+                def append_paragraph() -> None:
+                    nonlocal paragraph_lines
+                    if not paragraph_lines:
+                        return
+                    blocks.append(
+                        DocumentBlock(
+                            text=_clean("\n".join(line.text for line in paragraph_lines)),
+                            type="paragraph",
+                            order=len(blocks),
+                            section=headings.copy(),
+                            page_number=page_number,
+                            positions=[line.bbox for line in paragraph_lines],
+                            column_id=raw_block.column_id,
+                        )
+                    )
+                    paragraph_lines = []
+
+                while cursor < len(lines):
+                    line = lines[cursor]
+                    if _looks_like_pdf_heading(line, body_size):
+                        append_paragraph()
+                        title, cursor, level, subsection = _heading_run(lines, cursor, body_size)
+                        headings = _update_heading_path(headings, title, level)
+                        title_lines = lines[cursor - (2 if title != line.text else 1) : cursor]
+                        blocks.append(
+                            DocumentBlock(
+                                text=title,
+                                type="title",
+                                order=len(blocks),
+                                section=headings.copy(),
+                                page_number=page_number,
+                                positions=[item.bbox for item in title_lines],
+                                level=level,
+                                column_id=raw_block.column_id,
+                                is_subsection=subsection,
+                            )
+                        )
+                    else:
+                        paragraph_lines.append(line)
+                        cursor += 1
+                append_paragraph()
         page_count = len(pdf)
     return ParsedDocument(path.name, "pdf", blocks, page_count, outline)
 

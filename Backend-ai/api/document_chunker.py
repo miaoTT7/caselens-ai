@@ -257,7 +257,13 @@ def chunk_document(
         rendered = _render_text(block.section, block.text, document)
         pending_text = "\n".join(item.text for item in pending_blocks)
         combined = _render_text(block.section, f"{pending_text}\n{block.text}".strip(), document)
-        if pending_blocks and (block.section != pending_section or count_tokens(combined) > max_tokens):
+        crosses_column = (
+            pending_blocks
+            and pending_blocks[-1].column_id is not None
+            and block.column_id is not None
+            and pending_blocks[-1].column_id != block.column_id
+        )
+        if pending_blocks and (block.section != pending_section or crosses_column or count_tokens(combined) > max_tokens):
             flush_pending()
         if count_tokens(rendered) > max_tokens:
             flush_pending()
