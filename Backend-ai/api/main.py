@@ -14,6 +14,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.database import check_database_connection, close_database_connection, get_database_session
 from api.document_chunker import chunk_document
 from api.document_parser import parse_document, parse_docx, parse_pdf
+from api.claim_fact_extraction import ClaimFactExtractionService
+from api.claim_fact_validation import ClaimFactValidationService
+from api.coverage_assessment import CoverageAssessmentService
+from api.exclusion_assessment import ExclusionAssessmentService
+from api.obligation_assessment import ObligationAssessmentService
+from api.claim_calculation import ClaimCalculationService
+from api.claim_recommendation import ClaimRecommendationService
+from api.claim_schemas import (
+    ClaimFactExtractionRequest,
+    ClaimFactExtractionResponse,
+    FactValidationRequest,
+    FactValidationResponse,
+    CoverageAssessmentRequest,
+    CoverageAssessmentResponse,
+    ExclusionAssessmentRequest,
+    ExclusionAssessmentResponse,
+    ObligationAssessmentRequest,
+    ObligationAssessmentResponse,
+    ClaimCalculationRequest,
+    ClaimCalculationResponse,
+    ClaimRecommendationRequest,
+    ClaimRecommendationResponse,
+)
 from api.ingestion import DocumentIngestionService
 from api.llm_service import GroundedAnswerService, LLMProviderError
 from api.repositories import ChunkRepository, DocumentRepository, KnowledgeBaseRepository
@@ -258,6 +281,86 @@ async def ask_question(
         insufficient_evidence=answer.insufficient_evidence,
         citations=citations,
     )
+
+
+@app.post("/claim-facts/extract", response_model=ClaimFactExtractionResponse)
+async def extract_claim_facts(payload: ClaimFactExtractionRequest):
+    try:
+        return await ClaimFactExtractionService().extract(payload)
+    except LLMProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail=f"Claim fact extraction failed: {error}") from error
+
+
+@app.post("/claim-facts/validate", response_model=FactValidationResponse)
+async def validate_claim_facts(payload: FactValidationRequest):
+    return ClaimFactValidationService().validate(payload)
+
+
+@app.post("/coverage/assess", response_model=CoverageAssessmentResponse)
+async def assess_coverage(
+    payload: CoverageAssessmentRequest,
+    session: AsyncSession = Depends(get_database_session),
+):
+    try:
+        return await CoverageAssessmentService(session, model).assess(payload)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except LLMProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail=f"Coverage assessment failed: {error}") from error
+
+
+@app.post("/exclusions/assess", response_model=ExclusionAssessmentResponse)
+async def assess_exclusions(
+    payload: ExclusionAssessmentRequest,
+    session: AsyncSession = Depends(get_database_session),
+):
+    try:
+        return await ExclusionAssessmentService(session, model).assess(payload)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except LLMProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail=f"Exclusion assessment failed: {error}") from error
+
+
+@app.post("/obligations/assess", response_model=ObligationAssessmentResponse)
+async def assess_obligations(
+    payload: ObligationAssessmentRequest,
+    session: AsyncSession = Depends(get_database_session),
+):
+    try:
+        return await ObligationAssessmentService(session, model).assess(payload)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except LLMProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail=f"Obligation assessment failed: {error}") from error
+
+
+@app.post("/claims/calculate", response_model=ClaimCalculationResponse)
+async def calculate_claim(
+    payload: ClaimCalculationRequest,
+    session: AsyncSession = Depends(get_database_session),
+):
+    try:
+        return await ClaimCalculationService(session, model).calculate(payload)
+    except LookupError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except LLMProviderError as error:
+        raise HTTPException(status_code=502, detail=str(error)) from error
+    except (ValueError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=502, detail=f"Claim calculation failed: {error}") from error
+
+
+@app.post("/claims/recommend", response_model=ClaimRecommendationResponse)
+async def recommend_claim(payload: ClaimRecommendationRequest):
+    return ClaimRecommendationService().recommend(payload)
 
 
 @app.post(
