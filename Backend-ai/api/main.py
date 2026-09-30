@@ -21,6 +21,7 @@ from api.exclusion_assessment import ExclusionAssessmentService
 from api.obligation_assessment import ObligationAssessmentService
 from api.claim_calculation import ClaimCalculationService
 from api.claim_recommendation import ClaimRecommendationService
+from api.claim_assessment import ClaimAssessmentOrchestrator
 from api.claim_schemas import (
     ClaimFactExtractionRequest,
     ClaimFactExtractionResponse,
@@ -36,6 +37,8 @@ from api.claim_schemas import (
     ClaimCalculationResponse,
     ClaimRecommendationRequest,
     ClaimRecommendationResponse,
+    ClaimAssessmentRequest,
+    ClaimAssessmentResponse,
 )
 from api.ingestion import DocumentIngestionService
 from api.llm_service import GroundedAnswerService, LLMProviderError
@@ -361,6 +364,20 @@ async def calculate_claim(
 @app.post("/claims/recommend", response_model=ClaimRecommendationResponse)
 async def recommend_claim(payload: ClaimRecommendationRequest):
     return ClaimRecommendationService().recommend(payload)
+
+
+def get_claim_assessment_orchestrator(
+    session: AsyncSession = Depends(get_database_session),
+) -> ClaimAssessmentOrchestrator:
+    return ClaimAssessmentOrchestrator(session, model)
+
+
+@app.post("/claims/assess", response_model=ClaimAssessmentResponse)
+async def assess_claim(
+    payload: ClaimAssessmentRequest,
+    orchestrator: ClaimAssessmentOrchestrator = Depends(get_claim_assessment_orchestrator),
+):
+    return await orchestrator.assess(payload)
 
 
 @app.post(

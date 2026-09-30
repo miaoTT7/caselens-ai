@@ -307,3 +307,30 @@ class ClaimRecommendationRequest(BaseModel):
 class ClaimRecommendationResponse(BaseModel):
     claim_id: uuid.UUID
     recommendation: ClaimRecommendation
+
+
+class ClaimAssessmentRequest(BaseModel):
+    fnol_text: str = Field(min_length=1)
+    parsed_document_text: str | None = None
+    parsed_document_name: str | None = None
+    knowledge_base_id: uuid.UUID
+    retrieval_limit: int = Field(default=8, ge=1, le=20)
+    claimant_reference_required: bool = False
+    policy_reference_required: bool = False
+
+
+class ClaimAssessmentResponse(BaseModel):
+    status: Literal["completed", "partial", "failed"]
+    completed_phases: list[str] = Field(default_factory=list)
+    failed_phase: str | None = None
+    error: str | None = None
+    claim: Claim | None = None
+    facts: list[ClaimFact] = Field(default_factory=list)
+    validation_result: FactValidationResponse | None = None
+    missing_information: list[MissingInformation] = Field(default_factory=list)
+    applicable_policy: ApplicablePolicyAssessment | None = None
+    coverage_assessments: list[CoverageAssessment] = Field(default_factory=list)
+    exclusion_assessments: list[ExclusionAssessment] = Field(default_factory=list)
+    obligation_assessments: list[ObligationAssessment] = Field(default_factory=list)
+    calculation_results: list[CalculationResult] = Field(default_factory=list)
+    recommendation: ClaimRecommendation | None = None
