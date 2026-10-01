@@ -1,8 +1,12 @@
 import json
 import unittest
 import uuid
+import httpx
+from pydantic import ValidationError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+from groq import BadRequestError
 
 from api.claim_schemas import (
     Claim,
@@ -12,7 +16,7 @@ from api.claim_schemas import (
     ExclusionAssessmentRequest,
     Incident,
 )
-from api.exclusion_assessment import ExclusionAssessmentService
+from api.exclusion_assessment import ExclusionAssessmentService, _ExclusionPayload
 from api.schemas import SemanticSearchResult
 
 
@@ -195,6 +199,94 @@ class ExclusionAssessmentTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.exclusion_assessments[0].status, "indeterminate")
         self.assertEqual(len(result.missing_information), 1)
+
+    async def test_bicycle_exclusion_retries_json_generation_failure_once(self):
+        document_id = uuid.uuid4()
+        coverage = self.coverage(document_id)
+        claim = Claim(id=uuid.uuid4(), incidents=[Incident(
+            id=uuid.uuid4(), incident_type="theft", location="outside Zurich station"
+        )])
+        retrieval = SimpleNamespace(search=AsyncMock(return_value=[self.result(document_id)]))
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        provider_error = BadRequestError(
+            "json_validate_failed", response=response,
+            body={"error": {"code": "json_validate_failed"}},
+        )
+        successful = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "exclusions": [{
+                "exclusion_reference": "Art. 110.1.3 Simple theft outside the home",
+                "condition_logic": "all",
+                "conditions": [{
+                    "description": "The theft occurred outside the home.",
+                    "result": "matched",
+                    "fact_paths": ["incidents[0].location"],
+                    "policy_evidence_ids": ["P1"],
+                }],
+            }]
+        })))])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace()))
+        client.chat.completions.create = AsyncMock(side_effect=[provider_error, successful])
+        fact = ClaimFact(
+            id=uuid.uuid4(), fact_path="incidents[0].location",
+            value="outside Zurich station", status="confirmed",
+        )
+        service = ExclusionAssessmentService(
+            AsyncMock(), None, retrieval_service=retrieval, llm_client=client
+        )
+
+        result = await service.assess(ExclusionAssessmentRequest(
+            knowledge_base_id=uuid.uuid4(), claim=claim, facts=[fact],
+            coverage_assessments=[coverage], retrieval_limit=8,
+        ))
+
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+        self.assertEqual(result.exclusion_assessments[0].status, "applies")
+
+    def test_captured_groq_shape_removes_only_empty_exclusion_entries(self):
+        payload = _ExclusionPayload.model_validate({
+            "exclusions": [
+                {
+                    "exclusion_reference": "P1",
+                    "condition_logic": "all",
+                    "conditions": [{
+                        "description": (
+                            "Theft is simple theft and occurs outside the insured premises "
+                            "(outside Zurich station) and is not covered by supplementary insurance."
+                        ),
+                        "result": "matched",
+                        "fact_paths": [
+                            "incidents[0].incident_type",
+                            "incidents[0].location",
+                        ],
+                        "policy_evidence_ids": ["P1"],
+                    }],
+                },
+                "",
+                {
+                    "exclusion_reference": "P8-P9",
+                    "condition_logic": "any",
+                    "conditions": [{
+                        "description": "Cash assets are excluded from coverage.",
+                        "result": "unknown",
+                        "fact_paths": ["claim.claimed_amount"],
+                        "policy_evidence_ids": ["P8", "P9"],
+                    }],
+                },
+            ]
+        })
+
+        self.assertEqual(len(payload.exclusions), 2)
+        self.assertEqual(
+            [item.exclusion_reference for item in payload.exclusions],
+            ["P1", "P8-P9"],
+        )
+
+    def test_non_empty_invalid_exclusion_entry_still_fails_validation(self):
+        with self.assertRaises(ValidationError) as context:
+            _ExclusionPayload.model_validate({"exclusions": ["not-an-object"]})
+
+        self.assertIn("exclusions.0", str(context.exception))
 
 
 if __name__ == "__main__":

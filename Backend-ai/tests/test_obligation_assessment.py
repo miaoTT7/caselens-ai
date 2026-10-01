@@ -4,6 +4,9 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
+from groq import BadRequestError
+
 from api.claim_schemas import (
     Claim,
     ClaimFact,
@@ -189,6 +192,120 @@ class ObligationAssessmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(assessment.missing_information_ids), 1)
         self.assertEqual(result.missing_information[0].field_path, path)
         self.assertEqual(result.missing_information[0].related_incident_id, incident.id)
+
+    async def test_bicycle_theft_groq_null_effect_is_treated_as_unknown(self):
+        facts = [
+            self.fact("incidents[0].incident_type", "theft", "[C1]"),
+            self.fact("incidents[0].event_date", "2026-08-12", "[C2]"),
+            self.fact("incidents[0].location", "outside Zurich station", "[C3]"),
+            self.fact("claim.claimed_amount", "1800", "[C4]"),
+            self.fact("claim.currency", "CHF", "[C5]"),
+        ]
+        result, _, _, _ = await self.run_assessment(
+            {
+                "obligation_reference": "Art. 6.1",
+                "conditions": [{
+                    "description": "Notify police immediately upon theft",
+                    "result": "unknown",
+                    "fact_paths": ["incidents[0].incident_type"],
+                    "policy_evidence_ids": ["P1"],
+                }],
+                "requires_culpable_breach": True,
+                "culpable_breach": None,
+                "culpability_fact_paths": [],
+                "culpability_policy_evidence_ids": ["P1"],
+                "requires_effect_on_loss": True,
+                "effect_on_loss": None,
+                "effect_fact_paths": [],
+                "effect_policy_evidence_ids": ["P1"],
+                "permitted_consequence": "rejection or reduction",
+                "consequence_policy_evidence_ids": ["P1"],
+            },
+            facts,
+        )
+
+        assessment = result.obligation_assessments[0]
+        self.assertEqual(assessment.status, "indeterminate")
+        self.assertEqual(assessment.effect_on_loss, "unknown")
+        self.assertEqual(assessment.obligation_reference, "Art. 6.1")
+
+    async def test_bicycle_obligation_retries_json_generation_failure_once(self):
+        document_id = uuid.uuid4()
+        retrieval = SimpleNamespace(search=AsyncMock(return_value=[self.result(document_id)]))
+        client = self.client({
+            "obligations": [{
+                "obligation_reference": "Art. 6.1",
+                "conditions": [{
+                    "description": "Notify police immediately upon theft",
+                    "result": "unknown",
+                    "fact_paths": ["incidents[0].metadata.reported_to_police"],
+                    "policy_evidence_ids": ["P1"],
+                }],
+                "effect_on_loss": "unknown",
+            }]
+        })
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        client.chat.completions.create.side_effect = [
+            BadRequestError(
+                "json_validate_failed",
+                response=response,
+                body={"error": {"code": "json_validate_failed"}},
+            ),
+            client.chat.completions.create.return_value,
+        ]
+        service = ObligationAssessmentService(
+            AsyncMock(), None, retrieval_service=retrieval, llm_client=client
+        )
+        result = await service.assess(
+            ObligationAssessmentRequest(
+                knowledge_base_id=uuid.uuid4(),
+                claim=Claim(
+                    id=uuid.uuid4(),
+                    incidents=[Incident(id=uuid.uuid4(), incident_type="theft")],
+                ),
+                facts=[self.fact("incidents[0].incident_type", "theft", "[C1]")],
+                coverage_assessments=[self.coverage(document_id)],
+            )
+        )
+
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+        self.assertEqual(result.obligation_assessments[0].obligation_reference, "Art. 6.1")
+
+    async def test_both_json_generation_attempts_fail_returns_unavailable(self):
+        document_id = uuid.uuid4()
+        retrieval = SimpleNamespace(search=AsyncMock(return_value=[self.result(document_id)]))
+        client = self.client({})
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        response = httpx.Response(400, request=request)
+        errors = [
+            BadRequestError(
+                "json_validate_failed",
+                response=response,
+                body={"error": {"code": "json_validate_failed"}},
+            )
+            for _ in range(2)
+        ]
+        client.chat.completions.create.side_effect = errors
+        service = ObligationAssessmentService(
+            AsyncMock(), None, retrieval_service=retrieval, llm_client=client
+        )
+
+        result = await service.assess(ObligationAssessmentRequest(
+            knowledge_base_id=uuid.uuid4(),
+            claim=Claim(
+                id=uuid.uuid4(),
+                incidents=[Incident(id=uuid.uuid4(), incident_type="theft")],
+            ),
+            facts=[self.fact("incidents[0].incident_type", "theft", "[C1]")],
+            coverage_assessments=[self.coverage(document_id)],
+        ))
+
+        self.assertEqual(client.chat.completions.create.await_count, 2)
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.obligation_assessments, [])
+        self.assertTrue(result.missing_information[0].blocking)
+        self.assertTrue(result.missing_information[0].metadata["assessment_unavailable"])
 
     async def test_invalid_policy_evidence_cannot_prove_breach(self):
         path = "incidents[0].metadata.reported_to_police"

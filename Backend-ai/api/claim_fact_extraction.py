@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from groq import APIError
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 
 from api.claim_schemas import (
     Claim,
@@ -41,18 +41,28 @@ DATETIME_PATHS = {"claim.reported_date", "incidents[0].event_date"}
 
 class _ExtractedEvidence(BaseModel):
     source_id: str
-    text_quote: str
+    text_quote: str = Field(validation_alias=AliasChoices("text_quote", "quote"))
 
 
 class _ExtractedFact(BaseModel):
     fact_path: str
-    value: Any | None
-    confidence: float = Field(ge=0, le=1)
+    value: Any | None = Field(validation_alias=AliasChoices("value", "normalized_value"))
+    confidence: float | None = Field(default=None, ge=0, le=1)
     evidence: list[_ExtractedEvidence] = Field(default_factory=list)
 
 
 class _ExtractionPayload(BaseModel):
     facts: list[_ExtractedFact] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def include_every_allowed_path(self):
+        present = {fact.fact_path for fact in self.facts}
+        self.facts.extend(
+            _ExtractedFact(fact_path=path, value=None)
+            for path in FACT_PATHS
+            if path not in present
+        )
+        return self
 
 
 class ClaimFactExtractionService:
@@ -99,9 +109,10 @@ class ClaimFactExtractionService:
         return (
             "Extract only facts explicitly stated in the supplied claim sources. Never infer, "
             "guess, calculate, or fill missing values. Return JSON with a facts array. Each fact "
-            "must contain fact_path, normalized value, confidence, and evidence items containing "
-            "source_id and an exact supporting quote. Omit unsupported fields. Dates must use ISO "
-            "8601; amounts must contain digits only with an optional decimal point."
+            "must use exactly these keys: fact_path, value, confidence, evidence. Each evidence item "
+            "must use exactly these keys: source_id, text_quote. Copy source_id exactly as shown, "
+            "including square brackets. Return supported facts only. Dates must use ISO 8601; "
+            "amounts must contain digits only with an optional decimal point."
         )
 
     @staticmethod
@@ -131,6 +142,14 @@ class ClaimFactExtractionService:
             if value is None:
                 continue
             accepted[candidate.fact_path] = (value, candidate.confidence, evidence)
+
+        for candidate in cls._deterministic_candidates(sources):
+            if candidate.fact_path in accepted:
+                continue
+            evidence = cls._validated_evidence(candidate.evidence, sources, evidence_registry)
+            value = cls._normalize_value(candidate.fact_path, candidate.value)
+            if evidence and value is not None:
+                accepted[candidate.fact_path] = (value, candidate.confidence, evidence)
 
         facts = []
         for path in FACT_PATHS:
@@ -189,7 +208,8 @@ class ClaimFactExtractionService:
     ) -> list[EvidenceRef]:
         validated = []
         for candidate in candidates:
-            source = sources.get(candidate.source_id)
+            source_id = cls._canonical_source_id(candidate.source_id)
+            source = sources.get(source_id)
             quote = candidate.text_quote.strip()
             if not source or not quote or cls._compact(quote) not in cls._compact(source["text"]):
                 continue
@@ -198,11 +218,68 @@ class ClaimFactExtractionService:
                 evidence_type="claim",
                 source_file=source["source_file"],
                 text_quote=quote,
-                metadata={"source_id": candidate.source_id},
+                metadata={"source_id": source_id},
             )
             registry.append(evidence)
             validated.append(evidence)
         return validated
+
+    @staticmethod
+    def _canonical_source_id(value: str) -> str:
+        source_id = value.strip()
+        return source_id if source_id.startswith("[") and source_id.endswith("]") else f"[{source_id}]"
+
+    @classmethod
+    def _deterministic_candidates(
+        cls, sources: dict[str, dict[str, str]]
+    ) -> list[_ExtractedFact]:
+        candidates: list[_ExtractedFact] = []
+        month_names = (
+            "January|February|March|April|May|June|July|August|September|October|November|December"
+        )
+        date_pattern = re.compile(rf"\b(\d{{1,2}}\s+(?:{month_names})\s+\d{{4}})\b", re.IGNORECASE)
+        money_pattern = re.compile(
+            r"\b(CHF|EUR|USD|GBP)\s*([0-9][0-9' ,]*(?:\.[0-9]+)?)\b", re.IGNORECASE
+        )
+        location_pattern = re.compile(
+            rf"\b((?:outside|at|near|in)\s+[^.,]+?)(?=\s+on\s+\d{{1,2}}\s+(?:{month_names})\s+\d{{4}}|[.,]|$)",
+            re.IGNORECASE,
+        )
+        theft_pattern = re.compile(r"\b(stolen|theft)\b", re.IGNORECASE)
+        for source_id, source in sources.items():
+            text = source["text"]
+            if match := theft_pattern.search(text):
+                candidates.append(cls._candidate(
+                    "incidents[0].incident_type", "theft", source_id, match.group(0)
+                ))
+            if match := date_pattern.search(text):
+                try:
+                    normalized = datetime.strptime(match.group(1), "%d %B %Y").date().isoformat()
+                    candidates.append(cls._candidate(
+                        "incidents[0].event_date", normalized, source_id, match.group(1)
+                    ))
+                except ValueError:
+                    pass
+            if match := money_pattern.search(text):
+                amount = re.sub(r"[' ,]", "", match.group(2))
+                candidates.extend([
+                    cls._candidate("claim.claimed_amount", amount, source_id, match.group(0)),
+                    cls._candidate("claim.currency", match.group(1).upper(), source_id, match.group(0)),
+                ])
+            if match := location_pattern.search(text):
+                candidates.append(cls._candidate(
+                    "incidents[0].location", match.group(1).strip(), source_id, match.group(1).strip()
+                ))
+        return candidates
+
+    @staticmethod
+    def _candidate(path: str, value: Any, source_id: str, quote: str) -> _ExtractedFact:
+        return _ExtractedFact(
+            fact_path=path,
+            value=value,
+            confidence=1.0,
+            evidence=[_ExtractedEvidence(source_id=source_id, text_quote=quote)],
+        )
 
     @staticmethod
     def _compact(value: str) -> str:

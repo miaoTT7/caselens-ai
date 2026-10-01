@@ -39,7 +39,7 @@ class _ObligationCandidate(BaseModel):
     culpability_fact_paths: list[str] = Field(default_factory=list)
     culpability_policy_evidence_ids: list[str] = Field(default_factory=list)
     requires_effect_on_loss: bool | None = None
-    effect_on_loss: str = "unknown"
+    effect_on_loss: str | None = None
     effect_fact_paths: list[str] = Field(default_factory=list)
     effect_policy_evidence_ids: list[str] = Field(default_factory=list)
     permitted_consequence: str | None = None
@@ -103,7 +103,28 @@ class ObligationAssessmentService:
                 ),
             )
             evidence, evidence_by_id = self._policy_evidence(results)
-            payload = await self._extract_obligations(coverage, fact_map, evidence)
+            try:
+                payload = await self._extract_obligations(coverage, fact_map, evidence)
+            except LLMProviderError:
+                missing.append(
+                    self._missing(
+                        field_path="obligations.provider_assessment",
+                        reason=(
+                            "Policyholder obligations could not be assessed because the LLM "
+                            "provider was unavailable. Human review is required."
+                        ),
+                        question=None,
+                        related_incident_id=self._related_incident_id(request, coverage),
+                        related_exposure_id=coverage.exposure_id,
+                    ).model_copy(update={"metadata": {"assessment_unavailable": True}})
+                )
+                return ObligationAssessmentResponse(
+                    claim_id=request.claim.id,
+                    status="unavailable",
+                    error="Obligation assessment is unavailable due to an LLM provider failure.",
+                    obligation_assessments=[],
+                    missing_information=missing,
+                )
             coverage_results = self._build_assessments(
                 request, coverage, payload, fact_map, evidence_by_id, missing
             )
@@ -175,41 +196,50 @@ class ObligationAssessmentService:
         )
         prompt = (
             f"Coverage: {coverage.coverage_reference}\n"
-            "Extract only relevant policyholder obligations. Split independent duties into separate "
-            "obligations. For each obligation return obligation_reference and conditions. For each "
-            "condition return description, result (matched means complied with, unmatched means not "
-            "complied with, unknown means insufficient facts), fact_paths actually used, and "
-            "policy_evidence_ids. Also return requires_culpable_breach, culpable_breach, "
-            "culpability_fact_paths, culpability_policy_evidence_ids, requires_effect_on_loss, "
-            "effect_on_loss (affected, not_affected, or unknown), effect_fact_paths, "
-            "effect_policy_evidence_ids, permitted_consequence, and consequence_policy_evidence_ids. "
-            "Use null when the policy or claim evidence does not explicitly support a value. Do not "
-            "infer legal consequences, calculate payment, or make a claim recommendation. Return JSON "
-            "with an obligations array.\n\n"
+            "Return exactly one JSON object and nothing else: {\"obligations\":[{"
+            "\"obligation_reference\":\"...\",\"conditions\":[{\"description\":\"...\","
+            "\"result\":\"matched|unmatched|unknown\",\"fact_paths\":[],"
+            "\"policy_evidence_ids\":[]}],\"requires_culpable_breach\":null,"
+            "\"culpable_breach\":null,\"culpability_fact_paths\":[],"
+            "\"culpability_policy_evidence_ids\":[],\"requires_effect_on_loss\":null,"
+            "\"effect_on_loss\":\"unknown\",\"effect_fact_paths\":[],"
+            "\"effect_policy_evidence_ids\":[],\"permitted_consequence\":null,"
+            "\"consequence_policy_evidence_ids\":[]}]}. obligations[] may contain JSON objects only. "
+            "Always include every key. Use unknown for enum-like unknowns; use null only for nullable "
+            "boolean/text fields. Use only supplied facts and evidence. Do not infer consequences.\n\n"
             f"Claim facts:\n{fact_text or 'none'}\n\nPolicy evidence:\n{evidence_text or 'none'}"
         )
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
+        request_args = {
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
                         "content": (
-                            "Extract policyholder obligations conservatively from supplied evidence. "
-                            "Return grounded JSON only."
+                            "Extract grounded policyholder obligations. JSON only; no markdown or explanation."
                         ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-            )
-        except APIError as error:
-            raise LLMProviderError(f"Groq request failed: {error}") from error
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
+        try:
+            response = await self.client.chat.completions.create(**request_args)
+        except APIError as first_error:
+            if not self._is_json_generation_error(first_error):
+                raise LLMProviderError(f"Groq request failed: {first_error}") from first_error
+            try:
+                response = await self.client.chat.completions.create(**request_args)
+            except APIError as retry_error:
+                raise LLMProviderError(f"Groq request failed: {retry_error}") from retry_error
         content = response.choices[0].message.content
         if not content:
             raise ValueError("Groq returned an empty obligation assessment")
         return _ObligationPayload.model_validate(json.loads(content))
+
+    @staticmethod
+    def _is_json_generation_error(error: APIError) -> bool:
+        return getattr(error, "status_code", None) == 400 and "json_validate_failed" in str(error)
 
     @classmethod
     def _build_assessments(

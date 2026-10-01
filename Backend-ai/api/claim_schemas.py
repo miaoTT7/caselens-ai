@@ -275,6 +275,8 @@ class ObligationAssessmentRequest(BaseModel):
 
 class ObligationAssessmentResponse(BaseModel):
     claim_id: uuid.UUID
+    status: Literal["completed", "unavailable"] = "completed"
+    error: str | None = None
     obligation_assessments: list[ObligationAssessment] = Field(default_factory=list)
     missing_information: list[MissingInformation] = Field(default_factory=list)
 
@@ -331,6 +333,8 @@ class ClaimAssessmentResponse(BaseModel):
     applicable_policy: ApplicablePolicyAssessment | None = None
     coverage_assessments: list[CoverageAssessment] = Field(default_factory=list)
     exclusion_assessments: list[ExclusionAssessment] = Field(default_factory=list)
+    obligation_assessment_status: Literal["completed", "unavailable"] = "completed"
+    obligation_assessment_error: str | None = None
     obligation_assessments: list[ObligationAssessment] = Field(default_factory=list)
     calculation_results: list[CalculationResult] = Field(default_factory=list)
     recommendation: ClaimRecommendation | None = None

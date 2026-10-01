@@ -148,6 +148,65 @@ class CoverageAssessmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(assessment.unknown_conditions), 1)
         self.assertEqual(len(assessment.missing_information_ids), 1)
 
+    async def test_real_bicycle_flat_groq_shape_is_normalized(self):
+        document_id = uuid.uuid4()
+        retrieval = SimpleNamespace(search=AsyncMock(return_value=[self.policy_result(document_id)]))
+        incident = Incident(
+            id=uuid.uuid4(), incident_type="theft",
+            event_date=datetime(2026, 8, 12, tzinfo=timezone.utc),
+            location="outside Zurich station",
+        )
+        claim = Claim(id=uuid.uuid4(), incidents=[incident])
+        facts = [
+            ClaimFact(
+                id=uuid.uuid4(), fact_path="incidents[0].incident_type",
+                value="theft", status="extracted", confidence=1.0,
+                claim_evidence=[EvidenceRef(
+                    id="[C1]", evidence_type="claim", source_file="fnol_text",
+                    text_quote="stolen",
+                )],
+            ),
+            ClaimFact(
+                id=uuid.uuid4(), fact_path="incidents[0].event_date",
+                value=datetime(2026, 8, 12, tzinfo=timezone.utc),
+                status="extracted", confidence=1.0,
+            ),
+            ClaimFact(
+                id=uuid.uuid4(), fact_path="incidents[0].location",
+                value="outside Zurich station", status="extracted", confidence=1.0,
+            ),
+            ClaimFact(
+                id=uuid.uuid4(), fact_path="claim.claimed_amount",
+                value="1800", status="extracted", confidence=1.0,
+            ),
+            ClaimFact(
+                id=uuid.uuid4(), fact_path="claim.currency",
+                value="CHF", status="extracted", confidence=1.0,
+            ),
+        ]
+        service = CoverageAssessmentService(
+            AsyncMock(), None, retrieval_service=retrieval,
+            llm_client=self.client({
+                "candidates": [{
+                    "description": "Household contents theft coverage",
+                    "result": "matched",
+                    "fact_paths": ["incidents[0].incident_type"],
+                    "policy_evidence_ids": ["P1"],
+                }]
+            }),
+        )
+
+        result = await service.assess(CoverageAssessmentRequest(
+            knowledge_base_id=uuid.uuid4(), claim=claim, facts=facts, retrieval_limit=8
+        ))
+
+        assessment = result.coverage_assessments[0]
+        self.assertEqual(assessment.coverage_reference, "Household contents theft coverage")
+        self.assertEqual(assessment.matched_conditions, ["Household contents theft coverage"])
+        self.assertEqual(assessment.status, "potentially_covered")
+        self.assertEqual(assessment.policy_evidence[0].id, "[P1]")
+        self.assertEqual(assessment.claim_evidence[0].id, "[C1]")
+
 
 if __name__ == "__main__":
     unittest.main()

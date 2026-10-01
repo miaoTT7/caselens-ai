@@ -121,6 +121,8 @@ class ClaimAssessmentOrchestrator:
                 exclusion_assessments=exclusions.exclusion_assessments,
                 retrieval_limit=request.retrieval_limit,
             ))
+            state.obligation_assessment_status = obligations.status
+            state.obligation_assessment_error = obligations.error
             state.obligation_assessments = obligations.obligation_assessments
             state.missing_information.extend(obligations.missing_information)
             state.completed_phases.append(current_phase)

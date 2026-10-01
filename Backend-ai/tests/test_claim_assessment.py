@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 from fastapi.testclient import TestClient
 
 from api.claim_assessment import ClaimAssessmentOrchestrator
+from api.claim_recommendation import ClaimRecommendationService
 from api.claim_schemas import (
     ApplicablePolicyAssessment,
     CalculationResult,
@@ -157,6 +158,35 @@ class ClaimAssessmentOrchestrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.failed_phase, "coverage_assessment")
         services["coverage_service"].assess.assert_not_awaited()
         services["recommendation_service"].recommend.assert_not_called()
+
+    async def test_unavailable_obligations_continue_and_require_human_review(self):
+        services, claim, _, _, _, _, _ = self.build_services()
+        unavailable = MissingInformation(
+            id=uuid.uuid4(),
+            field_path="obligations.provider_assessment",
+            reason="Obligation assessment provider unavailable.",
+            required_for="obligation_assessment",
+            blocking=True,
+            metadata={"assessment_unavailable": True},
+        )
+        services["obligation_service"].assess.return_value = ObligationAssessmentResponse(
+            claim_id=claim.id,
+            status="unavailable",
+            error="Obligation assessment is unavailable due to an LLM provider failure.",
+            missing_information=[unavailable],
+        )
+        services["recommendation_service"] = ClaimRecommendationService()
+
+        result = await ClaimAssessmentOrchestrator(**services).assess(ClaimAssessmentRequest(
+            fnol_text="My bicycle was stolen.", knowledge_base_id=uuid.uuid4()
+        ))
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.obligation_assessment_status, "unavailable")
+        self.assertEqual(result.obligation_assessments, [])
+        self.assertEqual(result.recommendation.status, "needs_human_review")
+        self.assertTrue(result.recommendation.human_review_required)
+        services["calculation_service"].calculate.assert_awaited_once()
 
 
 class SimpleCalculationResponse:

@@ -5,7 +5,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from api.claim_calculation import ClaimCalculationService
+from pydantic import ValidationError
+
+from api.claim_calculation import (
+    ClaimCalculationService,
+    _FinancialTerms,
+    _normalize_financial_terms_payload,
+)
 from api.claim_schemas import Claim, ClaimCalculationRequest, ClaimFact, CoverageAssessment, EvidenceRef, Incident
 from api.schemas import SemanticSearchResult
 
@@ -117,6 +123,121 @@ class ClaimCalculationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.calculation_results[0].status, "incomplete")
         self.assertIsNone(response.calculation_results[0].payable_amount)
+
+    async def test_captured_scalar_deductible_is_normalized_but_not_treated_as_complete(self):
+        facts = [
+            self.fact("claim.claimed_amount", Decimal("1800"), "[C1]"),
+            self.fact("claim.eligible_amount", Decimal("1800"), "[C2]"),
+            self.fact("claim.currency", "CHF", "[C3]"),
+        ]
+        response, _, _ = await self.calculate({
+            "deductible": "200",
+            "percentage_limit": {
+                "percentage": "1.0",
+                "base_fact_path": "incidents[0].age",
+            },
+            "terms_complete": True,
+            "evidence_ids": ["P8", "P10", "P11"],
+        }, facts)
+
+        result = response.calculation_results[0]
+        self.assertEqual(result.status, "incomplete")
+        self.assertIsNone(result.payable_amount)
+        self.assertIsNone(result.deductible)
+        self.assertIn("policy.deductible", [
+            item.field_path for item in response.missing_information
+        ])
+
+    async def test_captured_grouped_prerequisites_are_normalized_but_require_evidence(self):
+        facts = [
+            self.fact("incidents[0].incident_type", "theft", "[C1]"),
+            self.fact("claim.claimed_amount", Decimal("1800"), "[C2]"),
+            self.fact("claim.eligible_amount", Decimal("1800"), "[C3]"),
+            self.fact("claim.currency", "CHF", "[C4]"),
+        ]
+        response, _, _ = await self.calculate({
+            "terms_complete": True,
+            "evidence_ids": ["P8", "P10", "P11"],
+            "deductible": {
+                "amount": "200",
+                "currency": "CHF",
+                "policy_evidence_ids": ["P11"],
+            },
+            "prerequisites": {
+                "matched": ["incidents[0].incident_type"],
+                "unmatched": [],
+                "unknown": [],
+            },
+        }, facts)
+
+        result = response.calculation_results[0]
+        self.assertEqual(result.status, "incomplete")
+        self.assertIsNone(result.payable_amount)
+        self.assertTrue(any(
+            item.field_path.startswith("calculation.prerequisite")
+            for item in response.missing_information
+        ))
+
+    def test_captured_completeness_evidence_list_is_moved_to_its_field(self):
+        raw = {
+            "terms_complete": ["P8", "P10", "P12"],
+            "deductible": {
+                "amount": "200",
+                "currency": "CHF",
+                "policy_evidence_ids": ["P12"],
+            },
+            "prerequisites": [{
+                "description": "incident_type is theft",
+                "result": "matched",
+                "fact_paths": ["incidents[0].incident_type"],
+                "policy_evidence_ids": ["P8"],
+            }],
+        }
+        terms = _FinancialTerms.model_validate(_normalize_financial_terms_payload(raw))
+
+        self.assertTrue(terms.terms_complete)
+        self.assertEqual(
+            terms.completeness_policy_evidence_ids,
+            ["P8", "P10", "P12"],
+        )
+
+    def test_canonical_financial_terms_shape_is_unchanged(self):
+        raw = {
+            "terms_complete": True,
+            "completeness_policy_evidence_ids": ["P1"],
+            "deductible": {
+                "amount": "200",
+                "currency": "CHF",
+                "policy_evidence_ids": ["P1"],
+            },
+            "prerequisites": [{
+                "description": "The incident is theft.",
+                "result": "matched",
+                "fact_paths": ["incidents[0].incident_type"],
+                "policy_evidence_ids": ["P1"],
+            }],
+        }
+
+        normalized = _normalize_financial_terms_payload(raw)
+        terms = _FinancialTerms.model_validate(normalized)
+
+        self.assertEqual(normalized, raw)
+        self.assertEqual(terms.deductible.amount, Decimal("200"))
+
+    def test_unsupported_financial_term_shapes_still_fail_validation(self):
+        malformed = [
+            {"deductible": "not-a-number"},
+            {"prerequisites": {"matched": "incidents[0].incident_type"}},
+            {"terms_complete": {"P1": True}},
+            {
+                "terms_complete": ["P1"],
+                "completeness_policy_evidence_ids": ["P2"],
+            },
+        ]
+
+        for raw in malformed:
+            with self.subTest(raw=raw), self.assertRaises(ValidationError):
+                _FinancialTerms.model_validate(_normalize_financial_terms_payload(raw))
 
     async def test_not_covered_is_not_applicable_without_retrieval(self):
         response, retrieval, _ = await self.calculate({}, [], coverage_status="not_covered")

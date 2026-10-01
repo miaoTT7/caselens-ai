@@ -31,6 +31,18 @@ class ClaimRecommendationService:
                 ["No coverage assessment is available to support a recommendation."],
             )
 
+        unavailable = [
+            item for item in request.missing_information
+            if item.required_for == "obligation_assessment"
+            and item.metadata.get("assessment_unavailable") is True
+        ]
+        if unavailable:
+            return self._result(
+                "needs_human_review",
+                ["The obligation assessment is unavailable and requires human review."],
+                human_review=True,
+            )
+
         exclusions = self._group(request.exclusion_assessments)
         obligations = self._group(request.obligation_assessments)
         calculations = self._group(request.calculation_results)

@@ -111,6 +111,21 @@ class ClaimRecommendationTests(unittest.TestCase):
         self.assertEqual(result.status, "needs_human_review")
         self.assertNotEqual(result.status, "recommend_decline")
 
+    def test_unavailable_obligation_assessment_needs_human_review(self):
+        missing = MissingInformation(
+            id=uuid.uuid4(),
+            field_path="obligations.provider_assessment",
+            reason="Obligation assessment provider unavailable.",
+            required_for="obligation_assessment",
+            blocking=True,
+            metadata={"assessment_unavailable": True},
+        )
+
+        result = self.recommend(missing_information=[missing])
+
+        self.assertEqual(result.status, "needs_human_review")
+        self.assertTrue(result.human_review_required)
+
 
 if __name__ == "__main__":
     unittest.main()

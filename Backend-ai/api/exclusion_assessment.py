@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Literal
 
 from groq import APIError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from api.claim_schemas import (
     ClaimFact,
@@ -39,6 +39,13 @@ class _ExclusionCandidate(BaseModel):
 
 class _ExclusionPayload(BaseModel):
     exclusions: list[_ExclusionCandidate] = Field(default_factory=list)
+
+    @field_validator("exclusions", mode="before")
+    @classmethod
+    def remove_empty_string_entries(cls, value):
+        if not isinstance(value, list):
+            return value
+        return [item for item in value if not (isinstance(item, str) and not item.strip())]
 
 
 class ExclusionAssessmentService:
@@ -145,37 +152,49 @@ class ExclusionAssessmentService:
         )
         prompt = (
             f"Coverage: {coverage.coverage_reference}\n"
-            "Extract only exclusions relevant to this coverage and incident. For each exclusion return "
-            "exclusion_reference, condition_logic ('all' when every condition is required, otherwise "
-            "'any'), and conditions. For every condition return description, result (matched, unmatched, "
-            "or unknown), fact_paths actually used, and policy_evidence_ids. A matched or unmatched result "
+            "Extract only exclusions relevant to this coverage and incident. Return this nested JSON "
+            "shape: {\"exclusions\":[{\"exclusion_reference\":\"...\",\"condition_logic\":\"all|any\","
+            "\"conditions\":[{\"description\":\"...\",\"result\":\"matched|unmatched|unknown\","
+            "\"fact_paths\":[],\"policy_evidence_ids\":[]}]}]}. A matched or unmatched result "
             "requires explicit claim facts and explicit policy evidence. Absence of a fact is unknown. "
+            "The exclusions array may contain JSON objects only; never include strings, empty entries, "
+            "or placeholders. "
             "Do not evaluate obligations, deductibles, limits, other insurance, payment, or make a final "
             "claim decision. Return JSON with an exclusions array.\n\n"
             f"Claim facts:\n{fact_text or 'none'}\n\nPolicy evidence:\n{evidence_text or 'none'}"
         )
+        request_args = {
+            "model": self.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract policy exclusion conditions conservatively. Use only supplied facts "
+                        "and evidence; return JSON only."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+        }
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                temperature=0,
-                response_format={"type": "json_object"},
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Extract policy exclusion conditions conservatively. Use only supplied facts "
-                            "and evidence; return JSON only."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-            )
-        except APIError as error:
-            raise LLMProviderError(f"Groq request failed: {error}") from error
+            response = await self.client.chat.completions.create(**request_args)
+        except APIError as first_error:
+            if not self._is_json_generation_error(first_error):
+                raise LLMProviderError(f"Groq request failed: {first_error}") from first_error
+            try:
+                response = await self.client.chat.completions.create(**request_args)
+            except APIError as retry_error:
+                raise LLMProviderError(f"Groq request failed: {retry_error}") from retry_error
         content = response.choices[0].message.content
         if not content:
             raise ValueError("Groq returned an empty exclusion assessment")
         return _ExclusionPayload.model_validate(json.loads(content))
+
+    @staticmethod
+    def _is_json_generation_error(error: APIError) -> bool:
+        return getattr(error, "status_code", None) == 400 and "json_validate_failed" in str(error)
 
     @classmethod
     def _build_assessments(

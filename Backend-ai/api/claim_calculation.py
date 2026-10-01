@@ -63,6 +63,56 @@ class _FinancialTerms(BaseModel):
     prerequisites: list[_Prerequisite] = Field(default_factory=list)
 
 
+def _normalize_financial_terms_payload(raw: Any) -> Any:
+    """Normalize only known, unambiguous Groq shorthands before strict validation."""
+    if not isinstance(raw, dict):
+        return raw
+    normalized = dict(raw)
+
+    for field in ("deductible", "limit", "sublimit"):
+        value = normalized.get(field)
+        if value is None or isinstance(value, (dict, bool)):
+            continue
+        if isinstance(value, (str, int, float, Decimal)):
+            try:
+                Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                continue
+            normalized[field] = {"amount": str(value)}
+
+    prerequisites = normalized.get("prerequisites")
+    allowed_results = {"matched", "unmatched", "unknown"}
+    if (
+        isinstance(prerequisites, dict)
+        and prerequisites
+        and set(prerequisites).issubset(allowed_results)
+        and all(isinstance(items, list) for items in prerequisites.values())
+        and all(isinstance(item, str) for items in prerequisites.values() for item in items)
+    ):
+        normalized["prerequisites"] = [
+            {
+                "description": item,
+                "result": result,
+                "fact_paths": [item],
+                "policy_evidence_ids": [],
+            }
+            for result in ("matched", "unmatched", "unknown")
+            for item in prerequisites.get(result, [])
+        ]
+
+    completeness = normalized.get("terms_complete")
+    existing_ids = normalized.get("completeness_policy_evidence_ids")
+    if (
+        isinstance(completeness, list)
+        and all(isinstance(item, str) for item in completeness)
+        and (existing_ids is None or existing_ids == completeness)
+    ):
+        normalized["terms_complete"] = bool(completeness)
+        normalized["completeness_policy_evidence_ids"] = list(completeness)
+
+    return normalized
+
+
 class ClaimCalculationService:
     def __init__(self, session, embedding_model, *, retrieval_service=None, llm_client=None,
                  llm_model: str | None = None):
@@ -132,14 +182,15 @@ class ClaimCalculationService:
         )
         fact_text = "\n".join(f"{path}: {fact.value}" for path, fact in facts.items())
         prompt = (
-            f"Coverage: {coverage.coverage_reference}\nExtract calculation inputs only. Monetary values and "
-            "percentages must be decimal strings. Return terms_complete and evidence IDs showing that the "
-            "retrieved clauses contain the complete relevant calculation basis. Optional fields are deductible, "
-            "limit, sublimit, percentage_limit (percentage and base_fact_path), other_insurance (rule must be "
-            "subtract_known_amount, no_reduction, coordination_required, pro_rata, or unknown), and prerequisites "
-            "For an other-insurance amount, also return the exact amount_fact_path from Claim facts. "
-            "with matched/unmatched/unknown result and fact paths. Omit a term when it is not stated. Never "
-            "calculate payable amount or infer a missing amount/rule. Return one JSON object.\n\n"
+            f"Coverage: {coverage.coverage_reference}\nReturn one JSON object of calculation inputs only. "
+            "Canonical schema: terms_complete is boolean; completeness_policy_evidence_ids is string[]. "
+            "deductible/limit/sublimit are objects {amount: decimal string, currency: string, "
+            "policy_evidence_ids: string[]}. percentage_limit is {percentage: decimal string, "
+            "base_fact_path: string|null, policy_evidence_ids: string[]}. other_insurance contains rule, "
+            "amount, amount_fact_path, currency, and policy_evidence_ids. prerequisites is an array of "
+            "{description, result: matched|unmatched|unknown, fact_paths: string[], "
+            "policy_evidence_ids: string[]}. Omit unstated optional terms. Do not infer inputs or calculate "
+            "payable amount. JSON only.\n\n"
             f"Claim facts:\n{fact_text or 'none'}\n\nPolicy evidence:\n{evidence_text or 'none'}"
         )
         try:
@@ -155,7 +206,8 @@ class ClaimCalculationService:
         content = response.choices[0].message.content
         if not content:
             raise ValueError("Groq returned empty calculation terms")
-        return _FinancialTerms.model_validate(json.loads(content))
+        raw_payload = json.loads(content)
+        return _FinancialTerms.model_validate(_normalize_financial_terms_payload(raw_payload))
 
     @classmethod
     def _calculate_one(cls, request, coverage, facts, terms, evidence_map, missing, active_count):

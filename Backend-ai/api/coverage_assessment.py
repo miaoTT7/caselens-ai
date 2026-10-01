@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from groq import APIError
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from api.claim_schemas import (
     ApplicablePolicyAssessment,
@@ -34,6 +34,24 @@ class _TriggerCondition(BaseModel):
 class _CoverageCandidate(BaseModel):
     coverage_reference: str
     conditions: list[_TriggerCondition] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_flat_condition_shape(cls, value):
+        if not isinstance(value, dict) or "coverage_reference" in value:
+            return value
+        if "description" not in value:
+            return value
+        description = value["description"]
+        return {
+            "coverage_reference": description,
+            "conditions": [{
+                "description": description,
+                "result": value.get("result", "unknown"),
+                "fact_paths": value.get("fact_paths", []),
+                "policy_evidence_ids": value.get("policy_evidence_ids", []),
+            }],
+        }
 
 
 class _CoveragePayload(BaseModel):
@@ -193,9 +211,11 @@ class CoverageAssessmentService:
         )
         fact_text = "\n".join(f"{path}: {fact.value}" for path, fact in facts.items())
         prompt = (
-            "Return candidate affirmative coverages only. For every basic trigger condition return: "
-            "description, result (matched, unmatched, or unknown), fact_paths actually used, and "
-            "policy_evidence_ids. Do not consider exclusions, obligations, deductibles, limits, "
+            "Return candidate affirmative coverages only in this nested JSON shape: "
+            "{\"candidates\":[{\"coverage_reference\":\"...\",\"conditions\":[{"
+            "\"description\":\"...\",\"result\":\"matched|unmatched|unknown\","
+            "\"fact_paths\":[],\"policy_evidence_ids\":[]}]}]}. Keep coverage_reference at "
+            "candidate level and trigger fields inside conditions. Do not consider exclusions, obligations, deductibles, limits, "
             "other insurance, or payment. Use only supplied facts and evidence.\n\n"
             f"Claim facts:\n{fact_text or 'none'}\n\nPolicy evidence:\n{evidence_text or 'none'}"
         )
