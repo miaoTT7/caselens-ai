@@ -109,7 +109,7 @@ class AgentTracingTests(unittest.IsolatedAsyncioTestCase):
         )
         agent._trace_terminal_state(state)
 
-        updated = agent.apply_missing_information_answers(
+        updated = await agent.apply_missing_information_answers(
             state,
             MissingInformationAnswerRequest(answers=[MissingInformationAnswer(
                 missing_information_id=missing.id,

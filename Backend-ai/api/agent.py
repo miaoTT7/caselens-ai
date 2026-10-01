@@ -246,11 +246,15 @@ class CaseLensAgent:
         tool_registry=None,
         handoff_builder=None,
         trace_collector=None,
+        history_service=None,
+        assessment_version_service=None,
     ):
         self.orchestrator = orchestrator
         self.router = router or CaseLensAgentRouter()
         self.tool_registry = tool_registry
         self.handoff_builder = handoff_builder
+        self.history_service = history_service
+        self.assessment_version_service = assessment_version_service
         if trace_collector is None:
             from api.agent_tracing import TraceCollector
 
@@ -278,16 +282,47 @@ class CaseLensAgent:
             "policy_reference_required": request.policy_reference_required,
         })
         state = self.router.route(state)
+        initial_events = []
+        if self.history_service is not None:
+            initial_events = await self.history_service.record_initial_assessment(
+                fnol_text=request.fnol_text,
+                state=state,
+                assessment_session_id=self._history_session_id(),
+            )
+        if (
+            self.assessment_version_service is not None
+            and self.assessment_version_service.is_stable_assessment(state)
+        ):
+            trigger_reference_id = next(
+                (
+                    event.event_id
+                    for event in initial_events
+                    if event.event_type == "fnol_submitted"
+                ),
+                None,
+            )
+            await self.assessment_version_service.create_version(
+                state,
+                trigger_type="initial_assessment",
+                trigger_reference_id=trigger_reference_id,
+            )
         self._trace_routing(state)
         self._trace_terminal_state(state)
         return state
 
-    def apply_missing_information_answers(
+    async def apply_missing_information_answers(
         self,
         state: CaseLensAgentState,
         request: MissingInformationAnswerRequest,
     ) -> CaseLensAgentState:
         updated = MissingInformationInteraction.apply_answers(state, request)
+        if self.history_service is not None:
+            await self.history_service.record_answers(
+                before=state,
+                after=updated,
+                request=request,
+                assessment_session_id=self._history_session_id(),
+            )
         self._trace_emit(
             "user_answer_applied",
             current_phase=updated.current_phase,
@@ -311,6 +346,12 @@ class CaseLensAgent:
                 self.handoff_builder = HumanReviewHandoffBuilder()
             started = perf_counter()
             handoff = self.handoff_builder.build(state)
+            if self.history_service is not None:
+                await self.history_service.record_handoff(
+                    state=state,
+                    handoff=handoff,
+                    assessment_session_id=self._history_session_id(),
+                )
             self._trace_emit(
                 "human_handoff",
                 current_phase=state.current_phase,
@@ -340,6 +381,11 @@ class CaseLensAgent:
             payload = state
         is_rerun = tool_name == "selective_rerun"
         if is_rerun:
+            if self.history_service is not None:
+                await self.history_service.record_rerun_started(
+                    state,
+                    self._history_session_id(),
+                )
             self._trace_emit(
                 "rerun_started", current_phase=state.current_phase,
                 next_action=state.next_action, tool_name=tool_name,
@@ -370,6 +416,40 @@ class CaseLensAgent:
             error=result.error,
         )
         if is_rerun:
+            rerun_state = (
+                result.output
+                if result.success and isinstance(result.output, CaseLensAgentState)
+                else None
+            )
+            rerun_events = []
+            if self.history_service is not None:
+                rerun_events = await self.history_service.record_rerun_completed(
+                    before=state,
+                    after=rerun_state,
+                    success=result.success,
+                    error=result.error,
+                    assessment_session_id=self._history_session_id(),
+                )
+            if (
+                self.assessment_version_service is not None
+                and rerun_state is not None
+                and rerun_state.rerun_failure_count == state.rerun_failure_count
+                and self.assessment_version_service.is_stable_assessment(rerun_state)
+            ):
+                trigger_reference_id = next(
+                    (
+                        event.event_id
+                        for event in rerun_events
+                        if event.event_type == "selective_rerun_completed"
+                    ),
+                    None,
+                )
+                await self.assessment_version_service.create_version(
+                    rerun_state,
+                    trigger_type="selective_rerun",
+                    trigger_reference_id=trigger_reference_id,
+                    rerun_from_phase=state.current_phase,
+                )
             self._trace_emit(
                 "rerun_completed", current_phase=state.current_phase,
                 next_action=state.next_action, tool_name=tool_name,
@@ -415,6 +495,10 @@ class CaseLensAgent:
             self.trace_collector.emit(event_type, **kwargs)
         except Exception:
             return
+
+    def _history_session_id(self) -> uuid.UUID | None:
+        trace = self.trace
+        return trace.trace_id if trace is not None else None
 
 
 class SelectiveRerunner:
